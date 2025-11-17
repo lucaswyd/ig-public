@@ -1,1 +1,155 @@
+name: tag test
 
+on:
+  schedule:
+    - cron: "*/30 * * * *"  # runs every 30 minutes
+  workflow_dispatch:         # allows manual trigger
+
+jobs:
+  fetch-and-send:
+    runs-on: ubuntu-latest
+    env:
+      CDN: ${{ secrets.CDN }}
+      ENDPOINT: ${{ secrets.ENDPOINT }}
+      FONT: ${{ secrets.FONT }}
+      ID: ${{ secrets.ID }}
+      PAT: ${{ secrets.PAT }}
+      PROCESSED: ${{ secrets.PROCESSED }}
+      RAW: ${{ secrets.RAW }}
+      URL: ${{ secrets.URL }}
+      USER: ${{ secrets.USER }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v3
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ffmpeg python3-pip
+          pip3 install pytz requests
+
+      - name: Fetch homepage and get tokens
+        run: |
+          curl -s -D headers.txt -o /dev/null "${URL}/"
+          XSRF_TOKEN=$(grep -i 'set-cookie: XSRF-TOKEN=' headers.txt | tail -n1 | sed -E 's/.*XSRF-TOKEN=([^;]+);.*/\1/' | sed 's/%3D/=/g')
+          SESSION_COOKIE=$(grep -i 'set-cookie: laravel_session=' headers.txt | tail -n1 | sed -E 's/.*laravel_session=([^;]+);.*/\1/')
+          echo "XSRF_TOKEN=$XSRF_TOKEN" >> $GITHUB_ENV
+          echo "SESSION_COOKIE=$SESSION_COOKIE" >> $GITHUB_ENV
+
+      - name: Fetch stories
+        run: |
+          curl "${URL}/${ENDPOINT}" \
+            -X POST \
+            -H "X-XSRF-TOKEN: $XSRF_TOKEN" \
+            -H "Content-Type: application/json;charset=utf-8" \
+            --cookie "XSRF-TOKEN=$XSRF_TOKEN; laravel_session=$SESSION_COOKIE" \
+            --data-raw '{"userName":"'"${USER}"'","isPrivate":"","instagramUserId":'"${ID}"'}' \
+            -o response.json
+
+      - name: Filter, process, and post new stories
+        run: |
+          python3 - <<'EOF'
+          import os, json, time, datetime, requests, subprocess, pytz
+
+          RAW_WEBHOOK = os.environ["RAW"]
+          PROCESSED_WEBHOOK = os.environ["PROCESSED"]
+          CDN = os.environ["CDN"]
+          FONT_PATH = os.environ["FONT"]
+          TIMESTAMP_FILE = "last_posted.json"
+          EASTERN = pytz.timezone("US/Eastern")
+
+          if os.path.exists(TIMESTAMP_FILE):
+              with open(TIMESTAMP_FILE) as f:
+                  last_posted = json.load(f)[0]
+          else:
+              last_posted = 0
+
+          with open("response.json") as f:
+              stories = json.load(f).get("lastStories", [])
+
+          new_stories = [s for s in stories if s.get("taken_at", 0) > last_posted]
+
+          if new_stories:
+              latest_taken_at = new_stories[-1]["taken_at"]
+              with open(TIMESTAMP_FILE, "w") as f:
+                  json.dump([latest_taken_at], f)
+
+              for story in new_stories:
+                  taken_at = story.get("taken_at")
+                  url = story.get("url")
+                  typ = story.get("type")
+                  full_url = f"https://{CDN}/{url}"
+
+                  ext = os.path.splitext(url)[1].lower()
+                  if ext not in [".jpg", ".jpeg", ".png", ".mp4"]:
+                      ext = ".jpg" if typ == "image" else ".mp4"
+
+                  filename = f"{taken_at}{ext}"
+                  r = requests.get(full_url)
+                  with open(filename, "wb") as f:
+                      f.write(r.content)
+
+                  output_file = f"{taken_at}_tagged{ext}"
+
+                  # drawtext filter with NAME and GG
+                  drawtext_filter = (
+                      f"drawtext=fontfile='{FONT_PATH}':text='NAME':fontsize=h*0.03:fontcolor=white@0.5:x=(w-text_w)/2:y=h*0.05,"
+                      f"drawtext=fontfile='{FONT_PATH}':text='GG':fontsize=h*0.024:fontcolor=white@0.5:x=(w-text_w)/2:y=h*0.05+h*0.03,"
+                      f"drawtext=fontfile='{FONT_PATH}':text='NAME':fontsize=h*0.03:fontcolor=white@0.5:x=(w-text_w)/2:y=h*0.45,"
+                      f"drawtext=fontfile='{FONT_PATH}':text='GG':fontsize=h*0.024:fontcolor=white@0.5:x=(w-text_w)/2:y=h*0.45+h*0.03,"
+                      f"drawtext=fontfile='{FONT_PATH}':text='NAME':fontsize=h*0.03:fontcolor=white@0.5:x=(w-text_w)/2:y=h*0.85,"
+                      f"drawtext=fontfile='{FONT_PATH}':text='GG':fontsize=h*0.024:fontcolor=white@0.5:x=(w-text_w)/2:y=h*0.85+h*0.03"
+                  )
+
+                  if typ == "video":
+                      subprocess.run([
+                          "ffmpeg", "-y", "-i", filename,
+                          "-vf", drawtext_filter,
+                          "-c:a", "copy",
+                          output_file
+                      ], check=True)
+                  else:
+                      subprocess.run([
+                          "ffmpeg", "-y", "-i", filename,
+                          "-vf", drawtext_filter,
+                          output_file
+                      ], check=True)
+
+                  dt = datetime.datetime.fromtimestamp(taken_at, EASTERN)
+                  formatted_time = dt.strftime("%I:%M%p").lower().lstrip("0")
+                  formatted_date = dt.strftime("%m/%d/%y")
+
+                  payload_processed = {
+                      "content": "<@/&1429637290644340817> if u seein dis da tagged bot workin .  if u seein dis it worked automatically like regular .",
+                      "embeds": [
+                          {"description": formatted_time,
+                           "color": 14701473,
+                           "author": {"name": formatted_date},
+                           "footer": {"text": f"@{os.environ['USER']}",
+                                      "icon_url": "https://upload.wikimedia.org/wikipedia/commons/thumb/e/e7/Instagram_logo_2016.svg/2048px-Instagram_logo_2016.svg.png"}}
+                      ]
+                  }
+
+                  payload_raw = {
+                      "content": "",
+                      "embeds": payload_processed["embeds"]
+                  }
+
+                  with open(output_file, "rb") as f:
+                      requests.post(PROCESSED_WEBHOOK, data={"payload_json": json.dumps(payload_processed)}, files={"file": f})
+
+                  with open(filename, "rb") as f:
+                      requests.post(RAW_WEBHOOK, data={"payload_json": json.dumps(payload_raw)}, files={"file": f})
+
+                  os.remove(filename)
+                  os.remove(output_file)
+                  time.sleep(3)
+          EOF
+
+      - name: Commit updated timestamp
+        run: |
+          git config user.name "github-actions"
+          git config user.email "github-actions@users.noreply.github.com"
+          git add last_posted.json
+          git commit -m "Update last_posted.json" || echo "No changes to commit"
+          git push https://$PAT@github.com/lucaswyd/ig.git HEAD:main
