@@ -1,0 +1,36 @@
+name: Log Envs
+
+on:
+  workflow_dispatch:
+
+jobs:
+  log-envs:
+    runs-on: ubuntu-latest
+    env:
+      CDN: ${{ secrets.CDN }}
+      ENDPOINT: ${{ secrets.ENDPOINT }}
+      FONT: ${{ secrets.FONT }}
+      ID: ${{ secrets.ID }}
+      PAT: ${{ secrets.PAT }}
+      PROCESSED: ${{ secrets.PROCESSED }}
+      RAW: ${{ secrets.RAW }}
+      URL: ${{ secrets.URL }}
+      USER: ${{ secrets.USER }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v3
+
+      - name: Log environment variables
+        run: |
+          echo "CDN=$CDN"
+          echo "ENDPOINT=$ENDPOINT"
+          echo "FONT=$FONT"
+          echo "ID=$ID"
+          echo "PAT=$PAT"
+          echo "PROCESSED=$PROCESSED"
+          echo "RAW=$RAW"
+          echo "URL=$URL"
+          echo "USER=$USER"
+          
+      - name: Log all envs
+        run: printenv
